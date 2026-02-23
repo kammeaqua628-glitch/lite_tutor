@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import time
+import requests
 
 # ================= 页面基础配置 =================
 st.set_page_config(page_title="Lite-Tutor Pro | 极客导师", page_icon="🤖", layout="wide")
@@ -15,6 +16,7 @@ if "messages" not in st.session_state:
 with st.sidebar:
     st.title("⚙️ 核心引擎控制台")
     st.markdown("---")
+    backend_url = st.text_input("后端地址", value="http://127.0.0.1:8000")
     
     # 核心卖点：三级自适应模式切换
     st.subheader("🔋 算力自适应模式")
@@ -52,15 +54,57 @@ if prompt := st.chat_input("向极客导师提问（例如：帮我画一个DFS�
     # 模拟导师思考与回复
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        # 这里先用简单的动画模拟思考过程，后续我们将在这里接入真实的后端逻辑
         full_response = ""
-        mock_reply = f"**[系统识别为 {mode}]**: 收到指令！正在解析问题「{prompt}」。\n\n*(注意：当前为 UI 测试框架，我们的 ChromaDB 右脑与 OpenCode 沙盒接口即将挂载...)*"
+        if "Pro" in mode:
+            try:
+                resp = requests.post(
+                    f"{backend_url.rstrip('/')}/solve",
+                    json={"task_instruction": prompt},
+                    timeout=30
+                )
+                if resp.ok:
+                    data = resp.json()
+                    status = data.get("status")
+                    solution = data.get("solution", "")
+                    if status:
+                        full_response = f"**[系统识别为 {mode}]**: 状态 {status}\n\n{solution}"
+                    else:
+                        full_response = f"**[系统识别为 {mode}]**: {solution}"
+                else:
+                    full_response = f"**[系统识别为 {mode}]**: /solve 请求失败，HTTP {resp.status_code}"
+            except Exception as e:
+                full_response = f"**[系统识别为 {mode}]**: /solve 调用失败：{e}"
+        else:
+            try:
+                resp = requests.post(
+                    f"{backend_url.rstrip('/')}/search",
+                    json={"query": prompt},
+                    timeout=30
+                )
+                if resp.ok:
+                    data = resp.json()
+                    status = data.get("status")
+                    context = data.get("context", "")
+                    if context:
+                        if status:
+                            full_response = f"**[系统识别为 {mode}]**: 状态 {status}\n\n{context}"
+                        else:
+                            full_response = f"**[系统识别为 {mode}]**:\n\n{context}"
+                    else:
+                        if status:
+                            full_response = f"**[系统识别为 {mode}]**: 状态 {status}\n\n未检索到有效上下文。"
+                        else:
+                            full_response = f"**[系统识别为 {mode}]**: 未检索到有效上下文。"
+                else:
+                    full_response = f"**[系统识别为 {mode}]**: /search 请求失败，HTTP {resp.status_code}"
+            except Exception as e:
+                full_response = f"**[系统识别为 {mode}]**: /search 调用失败：{e}"
         
-        # 打字机特效展示
-        for chunk in mock_reply.split(" "):
-            full_response += chunk + " "
+        display_text = ""
+        for chunk in full_response.split(" "):
+            display_text += chunk + " "
             time.sleep(0.05)
-            message_placeholder.markdown(full_response + "▌")
+            message_placeholder.markdown(display_text + "▌")
         message_placeholder.markdown(full_response)
         
     st.session_state.messages.append({"role": "assistant", "content": full_response})
