@@ -1,0 +1,3 @@
+KMP Algorithm Core Concept: KMP avoids redundant comparisons by utilizing a partial match table (next array) to skip characters safely during string matching.
+Depth-First Search (DFS): A graph traversal algorithm that explores as far as possible along each branch before backtracking. It commonly uses a Stack data structure.
+Big Data Principles: Hadoop uses HDFS for distributed storage and MapReduce for distributed processing of massive datasets.
