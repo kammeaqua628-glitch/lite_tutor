@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import time
+import json
 import requests
 
 st.set_page_config(page_title="Lite-Tutor Pro | 极客导师", page_icon="🤖", layout="wide")
@@ -32,11 +33,12 @@ with st.sidebar:
     st.title("⚙️ 战情室控制台")
     st.markdown("---")
     openclaw_url = st.text_input("OpenClaw Base URL", value="https://your-openclaw-host/v1")
+    edge_url = st.text_input("Edge Node URL", value="http://127.0.0.1:8000")
     api_key = st.text_input("API Key", type="password")
     model_name = st.text_input("Model", value="deepseek-chat")
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.6, step=0.1)
     max_tokens = st.slider("Max Tokens", min_value=128, max_value=4096, value=1024, step=64)
-    st.text_area("System Prompt", value=st.session_state.system_prompt, key="system_prompt", height=120)
+    st.text_area("System Prompt", key="system_prompt", height=120)
 
     st.markdown("---")
     st.subheader("🔋 算力自适应模式")
@@ -78,6 +80,43 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+def _fetch_edge_tools(base_url: str):
+    try:
+        resp = requests.get(f"{base_url.rstrip('/')}/tools", timeout=8)
+        if resp.ok:
+            data = resp.json()
+            return data.get("tools", [])
+    except Exception:
+        return []
+    return []
+
+def _call_edge_tool(base_url: str, name: str, arguments: dict):
+    try:
+        if name == "edge_compute_sandbox":
+            payload = {
+                "task_instruction": arguments.get("task_instruction", ""),
+                "code": arguments.get("code", ""),
+                "language": arguments.get("language", "python"),
+                "timeout": arguments.get("timeout", 20)
+            }
+            resp = requests.post(f"{base_url.rstrip('/')}/solve", json=payload, timeout=20)
+            if resp.ok:
+                return json.dumps(resp.json(), ensure_ascii=False)
+            return f"Tool execution failed: HTTP {resp.status_code}"
+        if name == "edge_knowledge_rag":
+            payload = {
+                "query": arguments.get("query", ""),
+                "mode": "hybrid",
+                "n_results": 2
+            }
+            resp = requests.post(f"{base_url.rstrip('/')}/search", json=payload, timeout=20)
+            if resp.ok:
+                return json.dumps(resp.json(), ensure_ascii=False)
+            return f"Tool execution failed: HTTP {resp.status_code}"
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Tool execution error: {e}"
+
 if prompt := st.chat_input("向极客导师提问（例如：帮我画一个DFS算法的树状结构）..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -96,6 +135,9 @@ if prompt := st.chat_input("向极客导师提问（例如：帮我画一个DFS�
             headers = {"Content-Type": "application/json"}
             if api_key.strip():
                 headers["Authorization"] = f"Bearer {api_key.strip()}"
+            tools = []
+            if "Pro" in mode and edge_url.strip():
+                tools = _fetch_edge_tools(edge_url)
             payload = {
                 "model": model_name.strip(),
                 "messages": messages,
@@ -103,6 +145,9 @@ if prompt := st.chat_input("向极客导师提问（例如：帮我画一个DFS�
                 "max_tokens": max_tokens,
                 "stream": False,
             }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
             endpoint = f"{openclaw_url.rstrip('/')}/chat/completions"
             try:
                 resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
@@ -110,7 +155,37 @@ if prompt := st.chat_input("向极客导师提问（例如：帮我画一个DFS�
                     data = resp.json()
                     choices = data.get("choices", [])
                     if choices and "message" in choices[0]:
-                        full_response = choices[0]["message"].get("content", "")
+                        message = choices[0]["message"]
+                        tool_calls = message.get("tool_calls", [])
+                        if tool_calls and tools:
+                            messages.append(message)
+                            for call in tool_calls:
+                                name = call.get("function", {}).get("name", "")
+                                raw_args = call.get("function", {}).get("arguments", "{}")
+                                try:
+                                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                                except Exception:
+                                    args = {}
+                                result = _call_edge_tool(edge_url, name, args)
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": call.get("id", ""),
+                                    "name": name,
+                                    "content": result
+                                })
+                            payload["messages"] = messages
+                            follow = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+                            if follow.ok:
+                                follow_data = follow.json()
+                                follow_choices = follow_data.get("choices", [])
+                                if follow_choices and "message" in follow_choices[0]:
+                                    full_response = follow_choices[0]["message"].get("content", "")
+                                else:
+                                    full_response = "OpenClaw 返回内容为空。"
+                            else:
+                                full_response = f"OpenClaw 请求失败，HTTP {follow.status_code}"
+                        else:
+                            full_response = message.get("content", "")
                     else:
                         full_response = "OpenClaw 返回内容为空。"
                 else:

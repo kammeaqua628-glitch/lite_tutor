@@ -1,6 +1,35 @@
 import os
+import re
+import math
 import chromadb
 from chromadb.utils import embedding_functions
+import urllib.request
+import urllib.error
+
+class HashEmbeddingFunction:
+    def __init__(self, dim: int = 64):
+        self.dim = dim
+        self.name = "hash-embedding"
+
+    def __call__(self, texts):
+        vectors = []
+        for text in texts:
+            vec = [0.0] * self.dim
+            tokens = [t for t in re.split(r"[^a-zA-Z0-9\u4e00-\u9fff]+", str(text).lower()) if t]
+            for token in tokens:
+                idx = hash(token) % self.dim
+                vec[idx] += 1.0
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            vectors.append([v / norm for v in vec])
+        return vectors
+
+def _can_reach(url: str, timeout: float = 3.0) -> bool:
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 class LocalRAGKnowledgeBase:
     """
@@ -13,10 +42,25 @@ class LocalRAGKnowledgeBase:
         # Persist the database locally in the project folder
         self.client = chromadb.PersistentClient(path=db_path)
         
-        # Using a lightweight, fast local embedding model (downloads automatically on first run)
-        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
-        )
+        mode = os.getenv("LITETUTOR_OFFLINE", "auto").strip().lower()
+        force_offline = mode in {"1", "true", "yes", "offline"}
+        force_online = mode in {"0", "false", "no", "online"}
+        mode_label = "offline"
+        if force_offline:
+            self.embedding_fn = HashEmbeddingFunction()
+        else:
+            allow_online = force_online or _can_reach("https://huggingface.co")
+            if allow_online:
+                try:
+                    self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+                        model_name="all-MiniLM-L6-v2"
+                    )
+                    mode_label = "online"
+                except Exception:
+                    self.embedding_fn = HashEmbeddingFunction()
+            else:
+                self.embedding_fn = HashEmbeddingFunction()
+        print(f"[SYSTEM] Embedding mode: {mode_label}")
         
         # Create or load the collection
         self.collection = self.client.get_or_create_collection(
@@ -50,20 +94,48 @@ class LocalRAGKnowledgeBase:
         )
         print("[SUCCESS] Ingestion complete!")
 
-    def query_knowledge(self, query_text: str, n_results: int = 2) -> str:
-        """Searches the database for the most relevant chunks."""
+    def _tokenize(self, text: str):
+        return [t for t in re.split(r"[^a-zA-Z0-9\u4e00-\u9fff]+", text.lower()) if t]
+
+    def _keyword_scores(self, query_text: str):
+        all_docs = self.collection.get(include=["documents"]).get("documents", [])
+        query_tokens = set(self._tokenize(query_text))
+        scores = []
+        for doc in all_docs:
+            doc_tokens = set(self._tokenize(doc))
+            score = len(query_tokens & doc_tokens)
+            if score > 0:
+                scores.append((doc, score))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores
+
+    def query_knowledge_chunks(self, query_text: str, n_results: int = 2):
         print(f"\n[SEARCH] Querying knowledge base for: '{query_text}'")
         results = self.collection.query(
             query_texts=[query_text],
             n_results=n_results
         )
-        
-        if not results['documents'][0]:
+        return results.get("documents", [[]])[0]
+
+    def query_knowledge(self, query_text: str, n_results: int = 2) -> str:
+        chunks = self.query_knowledge_chunks(query_text, n_results)
+        if not chunks:
             return "No relevant context found in the local knowledge base."
-            
-        # Combine the retrieved chunks into a single context string
-        context = "\n---\n".join(results['documents'][0])
-        return context
+        return "\n---\n".join(chunks)
+
+    def query_knowledge_hybrid(self, query_text: str, n_results: int = 2) -> str:
+        vector_chunks = self.query_knowledge_chunks(query_text, n_results * 2)
+        keyword_scores = self._keyword_scores(query_text)
+        combined = {}
+        for idx, doc in enumerate(vector_chunks):
+            combined[doc] = combined.get(doc, 0) + (1.0 / (idx + 1))
+        for rank, (doc, score) in enumerate(keyword_scores[: n_results * 4]):
+            combined[doc] = combined.get(doc, 0) + score + (0.5 / (rank + 1))
+        if not combined:
+            return "No relevant context found in the local knowledge base."
+        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+        top_docs = [doc for doc, _ in ranked[:n_results]]
+        return "\n---\n".join(top_docs)
 
 # Quick Local Test Block
 if __name__ == "__main__":
